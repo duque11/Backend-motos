@@ -9,6 +9,8 @@ from functools import wraps
 import smtplib, ssl, threading
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from sqlalchemy.orm import joinedload
+from sqlalchemy import func
 
 # Load environment variables (from absolute path to avoid issues)
 load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
@@ -20,12 +22,17 @@ app = Flask(__name__)
 CORS(app)
 
 # Database Configuration (PostgreSQL)
-DB_USER = os.getenv('DB_USER', 'taller_user')
-DB_PASSWORD = os.getenv('DB_PASSWORD', 'Moto2026*')
+DB_USER = os.getenv('DB_USER')
+DB_PASSWORD = os.getenv('DB_PASSWORD')
 DB_HOST = os.getenv('DB_HOST', 'localhost')
 DB_PORT = os.getenv('DB_PORT', '5432')
-DB_NAME = os.getenv('DB_NAME', 'taller_motos_db')
-JWT_SECRET = os.getenv('JWT_SECRET', 'super-secret-key-motos-2026')
+DB_NAME = os.getenv('DB_NAME')
+JWT_SECRET = os.getenv('JWT_SECRET')
+
+# Critical security check
+if not all([DB_USER, DB_PASSWORD, DB_NAME, JWT_SECRET]):
+    print("❌ CRITICAL ERROR: Missing essential environment variables (DB_USER, DB_PASSWORD, DB_NAME, JWT_SECRET).")
+    print("Please check your .env file.")
 
 app.config['SQLALCHEMY_DATABASE_URI'] = f'postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -35,7 +42,7 @@ db.init_app(app)
 # SMTP Config
 SMTP_SERVER = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
 SMTP_PORT = int(os.getenv('SMTP_PORT', 465))
-SMTP_USER = os.getenv('SMTP_USER', 'tallerdukepro@gmail.com')
+SMTP_USER = os.getenv('SMTP_USER', '')
 SMTP_PASS = os.getenv('SMTP_PASS', '') # User needs to provide this
 
 def send_welcome_email(mechanic_data):
@@ -106,14 +113,22 @@ def login():
     username = data.get('username')
     password = data.get('password')
 
-    # Specific credentials requested by user (Admin)
-    if username == "BADV" and password == "salva123":
+    # Administrative credentials (Loaded from .env)
+    ADMIN_USER = os.getenv('ADMIN_USER')
+    ADMIN_PASS = os.getenv('ADMIN_PASS')
+    ADMIN_NAME = os.getenv('ADMIN_NAME', 'Administrator')
+
+    if not ADMIN_USER or not ADMIN_PASS:
+        print("⚠️ Warning: ADMIN_USER or ADMIN_PASS not configured in .env")
+        return jsonify({'error': 'Admin login disabled'}), 503
+
+    if username == ADMIN_USER and password == ADMIN_PASS:
         token = jwt.encode({
             'user': username,
             'role': 'admin',
             'exp': datetime.utcnow() + timedelta(hours=24)
         }, JWT_SECRET, algorithm="HS256")
-        return jsonify({'token': token, 'user': 'Bryan Duque', 'role': 'admin'})
+        return jsonify({'token': token, 'user': ADMIN_NAME, 'role': 'admin'})
     
     # Check if it's a mechanic login (username = IS)
     mechanic = Mechanic.query.filter_by(username=username).first()
@@ -228,29 +243,37 @@ def search_parts():
 @app.route('/api/services', methods=['GET'])
 @token_required
 def get_services():
-    services = Service.query.order_by(Service.entry_date.desc()).all()
+    # Use joinedload to prevent N+1 queries for mechanics and parts
+    services = Service.query.options(
+        joinedload(Service.mechanic),
+        joinedload(Service.parts_used).joinedload(ServicePart.part)
+    ).order_by(Service.entry_date.desc()).limit(100).all()
     
-    total_count = len(services)
-    pending = len([s for s in services if s.status == 'Pendiente'])
-    completed = len([s for s in services if s.status == 'Completado' or s.status == 'Entregado'])
-    in_progress = total_count - pending - completed
+    # Use direct SQL aggregations for stats (MUCH faster than Python loops)
+    stats_query = db.session.query(
+        func.count(Service.id),
+        func.count(func.nullif(Service.status != 'Pendiente', True)), # Pending
+        func.count(func.nullif(Service.status.in_(['Completado', 'Entregado']), False)) # Completed
+    ).first()
+    
+    total_count, pending, completed = stats_query
+    in_progress = total_count - (pending or 0) - (completed or 0)
 
-    # Calculate revenue for current month
+    # Calculate revenue for current month using database aggregation
     now = datetime.utcnow()
-    try:
-        month_services = Service.query.filter(
-            db.func.extract('month', Service.entry_date) == now.month,
-            db.func.extract('year', Service.entry_date) == now.year
-        ).all()
-        
-        revenue = {
-            'labor': sum(s.labor_cost for s in month_services),
-            'parts': sum(s.parts_cost for s in month_services),
-            'total': sum(s.total_cost for s in month_services)
-        }
-    except Exception as e:
-        print(f"Error calculating revenue: {e}")
-        revenue = {'labor': 0, 'parts': 0, 'total': 0}
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    
+    revenue_query = db.session.query(
+        func.sum(Service.labor_cost),
+        func.sum(Service.parts_cost),
+        func.sum(Service.total_cost)
+    ).filter(Service.entry_date >= month_start).first()
+
+    revenue = {
+        'labor': float(revenue_query[0] or 0),
+        'parts': float(revenue_query[1] or 0),
+        'total': float(revenue_query[2] or 0)
+    }
 
     return jsonify({
         'services': [s.to_dict() for s in services],
@@ -482,7 +505,10 @@ def search_history():
     plate = request.args.get('plate', '').upper()
     if not plate:
         return jsonify([])
-    services = Service.query.filter(Service.plate_number.ilike(f'%{plate}%')).order_by(Service.entry_date.desc()).all()
+    services = Service.query.options(
+        joinedload(Service.mechanic),
+        joinedload(Service.parts_used).joinedload(ServicePart.part)
+    ).filter(Service.plate_number.ilike(f'%{plate}%')).order_by(Service.entry_date.desc()).all()
     return jsonify([s.to_dict() for s in services])
 
 # --- Public Status Endpoint (No Token Required) ---
@@ -505,7 +531,15 @@ def get_public_status(plate):
 @app.route('/api/clients', methods=['GET'])
 @token_required
 def get_clients():
-    clients = Client.query.all()
+    search = request.args.get('search', '')
+    query = Client.query
+    if search:
+        query = query.filter(
+            (Client.name.ilike(f'%{search}%')) | 
+            (Client.phone.ilike(f'%{search}%'))
+        )
+    # Limit to 50 for performance, can implement pagination if needed
+    clients = query.order_by(Client.name.asc()).limit(50).all()
     return jsonify([c.to_dict() for c in clients])
 
 @app.route('/api/clients', methods=['POST'])
