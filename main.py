@@ -21,20 +21,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__)
 CORS(app)
 
-# Database Configuration (PostgreSQL)
-DB_USER = os.getenv('DB_USER')
-DB_PASSWORD = os.getenv('DB_PASSWORD')
-DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_PORT = os.getenv('DB_PORT', '5432')
-DB_NAME = os.getenv('DB_NAME')
-JWT_SECRET = os.getenv('JWT_SECRET')
+# Database Configuration (Local SQLite for maximum privacy)
+DB_PATH = os.path.join(BASE_DIR, 'taller.db')
+JWT_SECRET = os.getenv('JWT_SECRET', 'local-dev-secret-duke-2026')
 
-# Critical security check
-if not all([DB_USER, DB_PASSWORD, DB_NAME, JWT_SECRET]):
-    print("❌ CRITICAL ERROR: Missing essential environment variables (DB_USER, DB_PASSWORD, DB_NAME, JWT_SECRET).")
-    print("Please check your .env file.")
-
-app.config['SQLALCHEMY_DATABASE_URI'] = f'postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}'
+app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{DB_PATH}'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db.init_app(app)
